@@ -53,12 +53,38 @@ def _success_body(records: list[dict]) -> dict:
     }
 
 
-def _record(domain: str, approved: bool, approved_at: str | None = "2026-03-14T12:00:00Z") -> dict:
+_UNSET = object()
+
+
+def _record(
+    domain: str,
+    approved: bool,
+    approved_at: str | None = "2026-03-14T12:00:00Z",
+    requested_domain: str | None = _UNSET,  # type: ignore[assignment]
+    match_type: str | None = None,
+) -> dict:
+    """One IabBuyerAgentResource in the shape SGP returns it.
+
+    By default the record echoes the domain it was queried with, which is what
+    SGP sends for a vendor registered under exactly the domain asked about.
+    Pass ``requested_domain`` to model a parent match (vendor at the apex,
+    query for a subdomain), or ``None`` to model a record SGP could not pair.
+    """
+    echoed = domain if requested_domain is _UNSET else requested_domain
+    if match_type is None:
+        if not echoed:
+            match_type = "unresolved"
+        elif echoed == domain:
+            match_type = "exact"
+        else:
+            match_type = "parent"
     return {
         "vendorId": hash(domain) & 0xFFFF,
         "vendorCompanyId": (hash(domain) + 1) & 0xFFFF,
         "companyName": domain.split(".")[0].title() + " Inc.",
         "domain": domain,
+        "requestedDomain": echoed,
+        "matchType": match_type,
         "iabBuyerAgentApproval": approved,
         "iabBuyerAgentApprovedAt": approved_at,
     }
@@ -273,92 +299,143 @@ class TestUnknownVendor:
 
 
 class TestDomainEchoMatching:
+    """Pairing is a lookup on the domain SGP echoes, never an inference.
+
+    Apex-versus-subdomain resolution lives on the SGP platform. What is
+    exercised here is that the client trusts ``requestedDomain`` and refuses
+    to attribute anything else.
+    """
+
     @pytest.mark.asyncio
-    async def test_apex_echo_resolves_to_queried_subdomain(self) -> None:
+    async def test_parent_echo_resolves_to_queried_subdomain(self) -> None:
+        """Vendor registered at the apex, product on a subdomain."""
+
         def handler(request: httpx.Request) -> httpx.Response:
-            # Queried news.foo.com; SGP answers with the vendor's apex domain.
-            return httpx.Response(200, json=_success_body([_record("foo.com", True)]))
+            return httpx.Response(
+                200,
+                json=_success_body([_record("foo.com", True, requested_domain="news.foo.com")]),
+            )
 
         client = _make_client(handler)
         results = await client.check_approvals(["news.foo.com"])
         record = results["news.foo.com"]
-        assert record is not None, "apex echo must not be discarded"
+        assert record is not None, "an echoed parent match must resolve"
         assert record.iab_buyer_agent_approval is True
+        assert record.domain == "foo.com"
+        assert record.match_type == "parent"
 
     @pytest.mark.asyncio
-    async def test_subdomain_echo_resolves_to_queried_apex(self) -> None:
+    async def test_exact_echo_resolves(self) -> None:
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=_success_body([_record("www2.foo.com", True)]))
+            return httpx.Response(200, json=_success_body([_record("foo.com", True)]))
 
         client = _make_client(handler)
         results = await client.check_approvals(["foo.com"])
         assert results["foo.com"] is not None
-        assert results["foo.com"].iab_buyer_agent_approval is True
+        assert results["foo.com"].match_type == "exact"
 
     @pytest.mark.asyncio
-    async def test_exact_match_wins_over_suffix_match(self) -> None:
-        """An apex record must not leak onto a subdomain that got its own record."""
+    async def test_one_record_per_requested_domain(self) -> None:
+        """SGP answers each queried domain separately, even for one vendor."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
                 json=_success_body(
                     [
-                        _record("news.foo.com", True),
-                        _record("foo.com", False),
+                        _record("foo.com", True),
+                        _record("foo.com", True, requested_domain="news.foo.com"),
                     ]
                 ),
             )
 
         client = _make_client(handler)
         results = await client.check_approvals(["foo.com", "news.foo.com"])
-        assert results["news.foo.com"].iab_buyer_agent_approval is True
-        assert results["foo.com"].iab_buyer_agent_approval is False
+        assert results["foo.com"] is not None
+        assert results["news.foo.com"] is not None
 
     @pytest.mark.asyncio
-    async def test_apex_record_covers_all_pending_subdomains(self) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=_success_body([_record("foo.com", True)]))
+    async def test_client_does_not_infer_a_parent_relationship(self) -> None:
+        """Without an echo naming it, a subdomain query stays UNKNOWN.
 
-        client = _make_client(handler)
-        results = await client.check_approvals(["a.foo.com", "b.foo.com"])
-        assert results["a.foo.com"] is not None
-        assert results["b.foo.com"] is not None
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("also_requested", [[], ["other.com"]])
-    async def test_suffix_match_respects_label_boundary(self, also_requested) -> None:
-        """notfoo.com must never be matched by a foo.com record.
-
-        Parametrized over a single-domain and a multi-domain request: the
-        boundary rule must hold even when the response contains exactly one
-        record, which is the shape the deal-request gate always produces.
+        The apex-to-subdomain rule is SGP's to apply. If SGP answers about
+        ``foo.com`` when ``news.foo.com`` was queried, the client must not
+        quietly decide the two are the same seller.
         """
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(200, json=_success_body([_record("foo.com", True)]))
 
         client = _make_client(handler)
-        results = await client.check_approvals(["notfoo.com", *also_requested])
-        assert results["notfoo.com"] is None
+        results = await client.check_approvals(["news.foo.com"])
+        assert results["news.foo.com"] is None
 
     @pytest.mark.asyncio
-    async def test_lone_unrelated_record_is_not_attributed(self, caplog) -> None:
-        """A one-record answer to a one-domain query must not be trusted blindly.
-
-        Regression: a "lone record answers a lone query" fallback made the
-        gate fail open -- SGP answering about any other vendor was accepted
-        as approval for the queried seller.
-        """
+    async def test_unresolved_record_is_logged_not_silently_dropped(self, caplog) -> None:
+        """SGP could not pair it, so neither does the client."""
 
         def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=_success_body([_record("vendor-canonical.com", True)]))
+            return httpx.Response(
+                200,
+                json=_success_body([_record("stray.com", True, requested_domain=None)]),
+            )
 
         client = _make_client(handler)
         with caplog.at_level("WARNING"):
-            results = await client.check_approvals(["seller-alias.com"])
+            results = await client.check_approvals(["foo.com"])
+        assert results["foo.com"] is None
+        assert "stray.com" in caplog.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("also_requested", [[], ["other.com"]])
+    async def test_record_echoing_an_unrequested_domain_is_ignored(
+        self, also_requested, caplog
+    ) -> None:
+        """An echo we did not ask for is never accepted.
+
+        Parametrized over a single-domain and a multi-domain request: the rule
+        must hold even when the response contains exactly one record, which is
+        the shape the deal-request gate always produces.
+        """
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json=_success_body(
+                    [_record("vendor-canonical.com", True, requested_domain="somewhere-else.com")]
+                ),
+            )
+
+        client = _make_client(handler)
+        with caplog.at_level("WARNING"):
+            results = await client.check_approvals(["seller-alias.com", *also_requested])
         assert results["seller-alias.com"] is None
-        assert "vendor-canonical.com" in caplog.text
+        assert "somewhere-else.com" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_record_without_an_echo_is_ignored(self, caplog) -> None:
+        """A record carrying no requestedDomain is not attributed to anything.
+
+        This is the shape an SGP deployment predating the echo returns. The
+        gate reports UNKNOWN and fails closed rather than guessing.
+        """
+        legacy = {
+            "vendorId": 1,
+            "vendorCompanyId": 2,
+            "companyName": "Foo Inc.",
+            "domain": "foo.com",
+            "iabBuyerAgentApproval": True,
+            "iabBuyerAgentApprovedAt": None,
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, json=_success_body([legacy]))
+
+        client = _make_client(handler)
+        with caplog.at_level("WARNING"):
+            results = await client.check_approvals(["foo.com"])
+        assert results["foo.com"] is None
+        assert "foo.com" in caplog.text
 
     @pytest.mark.asyncio
     async def test_empty_domain_record_is_not_attributed(self) -> None:
@@ -372,47 +449,15 @@ class TestDomainEchoMatching:
         assert results["foo.com"] is None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("order", [("foo.com", "b.foo.com"), ("b.foo.com", "foo.com")])
-    async def test_most_specific_parent_wins_regardless_of_response_order(self, order) -> None:
-        """Verdicts must not depend on the order records appear in the response."""
-        verdicts = {"foo.com": False, "b.foo.com": True}
+    @pytest.mark.parametrize("echo", ["foo.com.", "https://www.foo.com/x", "FOO.com"])
+    async def test_echo_is_normalized_before_pairing(self, echo) -> None:
+        """The echo goes through the same normalization as the query."""
 
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(
                 200,
-                json=_success_body([_record(d, verdicts[d]) for d in order]),
+                json=_success_body([_record("foo.com", True, requested_domain=echo)]),
             )
-
-        client = _make_client(handler)
-        results = await client.check_approvals(["a.b.foo.com"])
-        record = results["a.b.foo.com"]
-        assert record is not None
-        # b.foo.com is the more specific parent, so its verdict applies.
-        assert record.domain == "b.foo.com"
-        assert record.iab_buyer_agent_approval is True
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("order", [(True, False), (False, True)])
-    async def test_conflicting_duplicate_records_resolve_to_denial(self, order) -> None:
-        """Equally specific but contradictory records must not grant approval."""
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                200,
-                json=_success_body([_record("foo.com", approved) for approved in order]),
-            )
-
-        client = _make_client(handler)
-        results = await client.check_approvals(["news.foo.com"])
-        assert results["news.foo.com"] is not None
-        assert results["news.foo.com"].iab_buyer_agent_approval is False
-
-    @pytest.mark.asyncio
-    async def test_trailing_dot_fqdn_echo_matches(self) -> None:
-        """An FQDN-style echo (foo.com.) must resolve a queried foo.com."""
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=_success_body([_record("foo.com.", True)]))
 
         client = _make_client(handler)
         results = await client.check_approvals(["foo.com", "other.com"])
@@ -420,23 +465,16 @@ class TestDomainEchoMatching:
         assert results["other.com"] is None
 
     @pytest.mark.asyncio
-    async def test_unmatchable_record_is_logged_not_silently_dropped(self, caplog) -> None:
-        def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json=_success_body([_record("stray.com", True)]))
-
-        client = _make_client(handler)
-        with caplog.at_level("WARNING"):
-            await client.check_approvals(["a.com", "b.com"])
-        assert "stray.com" in caplog.text
-
-    @pytest.mark.asyncio
     async def test_resolved_record_is_what_gets_cached(self) -> None:
-        """Regression: an apex echo used to cache None, blocking for the TTL."""
+        """Regression: a parent match used to cache None, blocking for the TTL."""
         calls = {"n": 0}
 
         def handler(request: httpx.Request) -> httpx.Response:
             calls["n"] += 1
-            return httpx.Response(200, json=_success_body([_record("foo.com", True)]))
+            return httpx.Response(
+                200,
+                json=_success_body([_record("foo.com", True, requested_domain="news.foo.com")]),
+            )
 
         client = _make_client(handler)
         first = await client.check_approvals(["news.foo.com"])

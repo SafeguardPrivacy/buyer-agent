@@ -43,7 +43,17 @@ def normalize_unknown_policy(value: str) -> str:
 
 
 class ApprovalRecord(BaseModel):
-    """A single vendor's IAB buyer-agent approval status from IAB Diligence Platform."""
+    """A single vendor's IAB buyer-agent approval status from IAB Diligence Platform.
+
+    ``domain`` is the vendor's canonical domain as registered in SGP;
+    ``requested_domain`` is the domain from the query that this record answers,
+    echoed back in the exact spelling it was sent in. The two differ whenever a
+    seller domain is a subdomain of the domain its vendor is registered under --
+    a product on ``news.example.com`` belonging to the vendor ``example.com``.
+
+    Pair on ``requested_domain``, never on ``domain``: it is the only field that
+    says which question a record answers.
+    """
 
     model_config = ConfigDict(populate_by_name=True)
 
@@ -55,3 +65,9 @@ class ApprovalRecord(BaseModel):
     iab_buyer_agent_approved_at: datetime | None = Field(
         alias="iabBuyerAgentApprovedAt", default=None
     )
+    # Null when SGP could not pair the record with any queried domain
+    # (``match_type == "unresolved"``), or when the vendor was looked up by
+    # internal ID -- a path this client does not use.
+    requested_domain: str | None = Field(alias="requestedDomain", default=None)
+    # How SGP paired the record: "exact", "parent", "internalId", "unresolved".
+    match_type: str = Field(alias="matchType", default="")

@@ -22,7 +22,7 @@ GET /api/v1/integrations/iab/buyer-agent-approval?domain=a.com,b.com
 | Domain       | `domain` query parameter - Up to 10 domains per request |
 | Tenant scope | Results are scoped to the caller's SGP tenant           |
 
-The response contains one `IabBuyerAgentResource` per matched vendor:
+The response contains one `IabBuyerAgentResource` per **resolved domain**, not per vendor — query two domains that resolve to the same vendor and two records come back, each naming the domain it answers:
 
 ```json
 {
@@ -34,6 +34,8 @@ The response contains one `IabBuyerAgentResource` per matched vendor:
       "vendorCompanyId": 456,
       "companyName": "Example Publisher",
       "domain": "example.com",
+      "requestedDomain": "news.example.com",
+      "matchType": "parent",
       "iabBuyerAgentApproval": true,
       "iabBuyerAgentApprovedAt": "2026-03-14T12:00:00Z"
     }
@@ -51,18 +53,24 @@ Three response states matter to the buyer agent:
 
 ### Domain matching
 
-SGP is not required to echo back the exact spelling that was queried — it may answer with the vendor's canonical (apex) domain for a queried subdomain, or the reverse. The client therefore pairs each returned record back to the domain that was actually requested:
+The seller domain read off an ad product is frequently a subdomain of the domain its vendor is registered under in SGP — a product on `news.example.com` belonging to the vendor `example.com`. **SGP resolves this server-side** and states on every record which query it answers:
 
-1. Exact match on the normalized domain.
-2. Otherwise a parent/child match on a label boundary — so an `example.com` record resolves a queried `news.example.com`, while `notexample.com` is never matched by an `example.com` record.
+| Field | Meaning |
+|---|---|
+| `domain` | The vendor's canonical domain, as registered in SGP |
+| `requestedDomain` | The domain from the `domain` query parameter that this record answers, echoed in the spelling it was sent in |
+| `matchType` | `exact` — the vendor is registered under the queried domain · `parent` — the queried domain is a subdomain of it · `unresolved` — SGP could not pair the record with anything queried |
 
-Matching is deliberately conservative, and there is no third step: a record for an unrelated domain is **never** accepted as the verdict for a queried one, not even when it is the only record in the response. Attributing another vendor's approval would make the gate fail open, and the deal-request stage always queries exactly one domain — precisely the shape where a permissive fallback does the most damage.
+The client pairs on `requestedDomain` and nothing else. That is a dictionary lookup, not an inference: no apex-versus-subdomain reasoning happens on this side, no model is involved at any point, and the same response always produces the same verdict.
 
-When more than one record legitimately matches, the **most specific** (longest) matching domain wins, so a verdict never depends on the order records happen to appear in the response. Among equally specific records, a non-approval wins — a response carrying contradictory records can never upgrade a vendor to approved.
+A record SGP marks `unresolved`, or one echoing a domain this client did not ask about, is logged at `WARNING` and ignored. A record is **never** attributed to a queried domain it does not name, not even when it is the only record in the response — attributing another vendor's approval would make the gate fail open, and the deal-request stage always queries exactly one domain, precisely the shape where a permissive fallback does the most damage.
 
-A record that cannot be paired with any requested domain is logged at `WARNING` and ignored rather than silently dropped.
+Resolution is one-directional. An `example.com` vendor answers a queried `news.example.com`; a vendor registered at `ads.example.com` does **not** answer a queried `example.com`. Domain control is inherited downward, not upward, so approving one subdomain says nothing about the parent domain or its siblings — a rule in the other direction would let one tenant's approval cover every sibling subdomain of a shared host.
 
-This matters for caching: whatever the client resolves is what gets cached for `SGP_CACHE_TTL_SECONDS`. An unresolved approval would otherwise report the vendor as UNKNOWN and suppress that verdict for the full TTL.
+This matters for caching: whatever resolves here is what gets cached for `SGP_CACHE_TTL_SECONDS`.
+
+!!! note "Requires an SGP deployment that echoes `requestedDomain`"
+    Records without `requestedDomain` are ignored, so an SGP environment predating the echo reports every seller as UNKNOWN, which the default `SGP_UNKNOWN_VENDOR_POLICY=block` then blocks. Production (`api.safeguardprivacy.com`) and staging (`api.safeguardprivacy-demo.com`) both return it. Point `SGP_BASE_URL` at one of those.
 
 ### Transient failures and retries
 
@@ -230,7 +238,9 @@ The class is prefixed `SGP` so future vendor-approval integrations can coexist u
 | `ValidationError` for `sgp_unknown_vendor_policy` at startup | `SGP_UNKNOWN_VENDOR_POLICY` is set to something outside `block` / `warn` / `allow`. Casing is not the problem (it is normalized); a typo is. |
 | Gate seems to do nothing | `SGP_ENFORCE=false` (the default) — the gate is fully inert. With `SGP_ENFORCE=true` and no key, the pipeline fails closed instead (no sellers pass discovery); check the logs and `sgp.vendor_gate` events. |
 | `Deal blocked: cannot determine seller domain` / discovery reports `N missing seller domain` | The product carries none of the domain fields the gate probes, so it is blocked without SGP being called. Populate the Product `domain` field — see [Domain matching](#domain-matching). |
-| Log: `SGP returned an approval record for <domain> that could not be paired with any requested domain` | SGP answered about a domain unrelated to any queried one. The record is ignored and the queried domain stays UNKNOWN. Confirm the vendor's domain in SGP matches the seller domain on the product. |
+| Log: `SGP returned an approval record for <domain> that it could not pair with any requested domain` | SGP answered with a record it marked `unresolved`. It is ignored and the queried domain stays UNKNOWN. Confirm the vendor's domain in SGP matches the seller domain on the product. |
+| Log: `SGP returned an approval record echoing <domain>, which was not requested` | The echoed `requestedDomain` is not one this client asked about. The record is ignored. This should not happen against a healthy SGP — check for a proxy rewriting the `domain` query parameter. |
+| Every seller reports UNKNOWN and no record pairs | `SGP_BASE_URL` points at an SGP deployment that does not return `requestedDomain` — see [Domain matching](#domain-matching). |
 
 ## Related
 

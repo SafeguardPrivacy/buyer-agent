@@ -88,20 +88,6 @@ def extract_product_domain(product: dict) -> str | None:
     return None
 
 
-def _same_site(requested: str, returned: str) -> bool:
-    """True when two hostnames are the same site, or one is a parent of the other.
-
-    Compares on a label boundary, so ``notexample.com`` never matches
-    ``example.com``. Used to pair an SGP response back to the domain that
-    was actually queried when the platform echoes a different spelling.
-    """
-    if not requested or not returned:
-        return False
-    if requested == returned:
-        return True
-    return requested.endswith("." + returned) or returned.endswith("." + requested)
-
-
 class SGPClientError(Exception):
     """Error raised by SGPClient for API or transport failures."""
 
@@ -122,6 +108,11 @@ class SGPClient:
     ``cache_ttl_seconds``. Returns a dict keyed by normalized domain; a
     value of ``None`` means the vendor is unknown to SGP (HTTP 404 or
     absent from the batch response).
+
+    Responses are paired back to the queried domain by the ``requestedDomain``
+    SGP echoes on each record, so a seller domain that is a subdomain of the
+    domain its vendor is registered under still resolves. See the
+    "Domain matching" section of docs/integration/iab-diligence-platform.md.
 
     Args:
         api_key: SGP API key with ``iab:buyerAgent`` scope.
@@ -365,60 +356,42 @@ class SGPClient:
         by_domain: dict[str, ApprovalRecord | None] = {d: None for d in domains}
         requested = set(domains)
 
-        # Pass 1: records whose echoed domain matches a requested one exactly.
-        leftover: list[tuple[str, ApprovalRecord]] = []
+        # SGP echoes the queried domain on every record it could pair, so a
+        # record says for itself which question it answers. Pairing is a lookup,
+        # not an inference: nothing here reasons about apex-vs-subdomain, and a
+        # record that does not name a domain we asked about is never attributed
+        # to one -- guessing would make an enforcing gate fail open.
         for raw in raw_records:
             try:
                 record = ApprovalRecord.model_validate(raw)
             except (ValueError, TypeError):
                 logger.warning("Skipping malformed SGP record: %r", raw)
                 continue
-            key = self.normalize_domain(record.domain) or record.domain.strip().lower()
-            if key in requested:
-                by_domain[key] = record
-            else:
-                leftover.append((key, record))
 
-        # Pass 2: SGP may answer with the vendor's canonical/apex domain for a
-        # queried subdomain (or the reverse). Resolve those against domains
-        # still unanswered so the record is not discarded -- dropping it would
-        # leave the requested domain looking UNKNOWN and, because
-        # ``check_approvals`` caches whatever lands here, would block an
-        # approved vendor for the full cache TTL.
-        #
-        # Matching is deliberately conservative: only a parent/child match on a
-        # label boundary counts. A record for an unrelated domain is never
-        # accepted as the verdict for a queried one, not even when it is the
-        # only record in the response -- attributing another vendor's approval
-        # would make this gate fail open.
-        used: set[int] = set()
-        for d in domains:
-            if by_domain[d] is not None:
+            if record.match_type == "unresolved" or not record.requested_domain:
+                # SGP itself could not tell which queried domain this answers.
+                logger.warning(
+                    "SGP returned an approval record for %r that it could not pair "
+                    "with any requested domain %s; ignoring it",
+                    record.domain,
+                    domains,
+                )
                 continue
-            candidates = [
-                (key, record, i) for i, (key, record) in enumerate(leftover) if _same_site(d, key)
-            ]
-            if not candidates:
-                continue
-            # Most specific (longest) matching domain wins. Among equally
-            # specific records a non-approval wins, so a response carrying
-            # conflicting records can never upgrade a vendor to approved.
-            key, record, index = min(
-                candidates,
-                key=lambda c: (-len(c[0]), c[1].iab_buyer_agent_approval),
-            )
-            by_domain[d] = record
-            used.add(index)
 
-        for i, (key, record) in enumerate(leftover):
-            if i in used or any(_same_site(d, key) for d in domains):
-                # Either applied, or pairable but a more specific record won.
+            key = self.normalize_domain(record.requested_domain)
+            if key not in requested:
+                logger.warning(
+                    "SGP returned an approval record echoing %r, which was not "
+                    "requested in %s; ignoring it",
+                    record.requested_domain,
+                    domains,
+                )
                 continue
-            logger.warning(
-                "SGP returned an approval record for %r that could not be paired "
-                "with any requested domain %s; ignoring it",
-                record.domain,
-                domains,
-            )
+
+            # SGP emits at most one record per requested domain, so this never
+            # overwrites a verdict already resolved for ``key``. If that invariant
+            # ever breaks, the last record in the response would win -- reintroducing
+            # the order-dependence this echo exists to remove.
+            by_domain[key] = record
 
         return by_domain
