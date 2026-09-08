@@ -416,7 +416,7 @@ class TestDomainEchoMatching:
     async def test_record_without_an_echo_is_ignored(self, caplog) -> None:
         """A record carrying no requestedDomain is not attributed to anything.
 
-        This is the shape an SGP deployment predating the echo returns. The
+        There is nothing on the record saying which query it answers, so the
         gate reports UNKNOWN and fails closed rather than guessing.
         """
         legacy = {

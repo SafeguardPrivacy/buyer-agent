@@ -110,9 +110,7 @@ class SGPClient:
     absent from the batch response).
 
     Responses are paired back to the queried domain by the ``requestedDomain``
-    SGP echoes on each record, so a seller domain that is a subdomain of the
-    domain its vendor is registered under still resolves. See the
-    "Domain matching" section of docs/integration/iab-diligence-platform.md.
+    SGP echoes on each record. See docs/integration/iab-diligence-platform.md.
 
     Args:
         api_key: SGP API key with ``iab:buyerAgent`` scope.
@@ -356,11 +354,8 @@ class SGPClient:
         by_domain: dict[str, ApprovalRecord | None] = {d: None for d in domains}
         requested = set(domains)
 
-        # SGP echoes the queried domain on every record it could pair, so a
-        # record says for itself which question it answers. Pairing is a lookup,
-        # not an inference: nothing here reasons about apex-vs-subdomain, and a
-        # record that does not name a domain we asked about is never attributed
-        # to one -- guessing would make an enforcing gate fail open.
+        # Every record names the domain it answers, so pairing is a lookup.
+        # A record naming nothing we asked about is never attributed to one.
         for raw in raw_records:
             try:
                 record = ApprovalRecord.model_validate(raw)
@@ -369,7 +364,6 @@ class SGPClient:
                 continue
 
             if record.match_type == "unresolved" or not record.requested_domain:
-                # SGP itself could not tell which queried domain this answers.
                 logger.warning(
                     "SGP returned an approval record for %r that it could not pair "
                     "with any requested domain %s; ignoring it",
@@ -388,10 +382,7 @@ class SGPClient:
                 )
                 continue
 
-            # SGP emits at most one record per requested domain, so this never
-            # overwrites a verdict already resolved for ``key``. If that invariant
-            # ever breaks, the last record in the response would win -- reintroducing
-            # the order-dependence this echo exists to remove.
+            # SGP emits at most one record per requested domain.
             by_domain[key] = record
 
         return by_domain

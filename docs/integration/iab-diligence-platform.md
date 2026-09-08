@@ -61,16 +61,13 @@ The seller domain read off an ad product is frequently a subdomain of the domain
 | `requestedDomain` | The domain from the `domain` query parameter that this record answers, echoed in the spelling it was sent in |
 | `matchType` | `exact` — the vendor is registered under the queried domain · `parent` — the queried domain is a subdomain of it · `unresolved` — SGP could not pair the record with anything queried |
 
-The client pairs on `requestedDomain` and nothing else. That is a dictionary lookup, not an inference: no apex-versus-subdomain reasoning happens on this side, no model is involved at any point, and the same response always produces the same verdict.
+The client pairs on `requestedDomain` and nothing else.
 
-A record SGP marks `unresolved`, or one echoing a domain this client did not ask about, is logged at `WARNING` and ignored. A record is **never** attributed to a queried domain it does not name, not even when it is the only record in the response — attributing another vendor's approval would make the gate fail open, and the deal-request stage always queries exactly one domain, precisely the shape where a permissive fallback does the most damage.
+A record SGP marks `unresolved`, or one echoing a domain this client did not ask about, is logged at `WARNING` and ignored. A record is **never** attributed to a queried domain it does not name, not even when it is the only record in the response.
 
-Resolution is one-directional. An `example.com` vendor answers a queried `news.example.com`; a vendor registered at `ads.example.com` does **not** answer a queried `example.com`. Domain control is inherited downward, not upward, so approving one subdomain says nothing about the parent domain or its siblings — a rule in the other direction would let one tenant's approval cover every sibling subdomain of a shared host.
+Resolution is one-directional. An `example.com` vendor answers a queried `news.example.com`; a vendor registered at `ads.example.com` does **not** answer a queried `example.com`. Approving a subdomain never approves the domain above it.
 
 This matters for caching: whatever resolves here is what gets cached for `SGP_CACHE_TTL_SECONDS`.
-
-!!! note "Requires an SGP deployment that echoes `requestedDomain`"
-    Records without `requestedDomain` are ignored, so an SGP environment predating the echo reports every seller as UNKNOWN, which the default `SGP_UNKNOWN_VENDOR_POLICY=block` then blocks. Production (`api.safeguardprivacy.com`) and staging (`api.safeguardprivacy-demo.com`) both return it. Point `SGP_BASE_URL` at one of those.
 
 ### Transient failures and retries
 
@@ -239,8 +236,7 @@ The class is prefixed `SGP` so future vendor-approval integrations can coexist u
 | Gate seems to do nothing | `SGP_ENFORCE=false` (the default) — the gate is fully inert. With `SGP_ENFORCE=true` and no key, the pipeline fails closed instead (no sellers pass discovery); check the logs and `sgp.vendor_gate` events. |
 | `Deal blocked: cannot determine seller domain` / discovery reports `N missing seller domain` | The product carries none of the domain fields the gate probes, so it is blocked without SGP being called. Populate the Product `domain` field — see [Domain matching](#domain-matching). |
 | Log: `SGP returned an approval record for <domain> that it could not pair with any requested domain` | SGP answered with a record it marked `unresolved`. It is ignored and the queried domain stays UNKNOWN. Confirm the vendor's domain in SGP matches the seller domain on the product. |
-| Log: `SGP returned an approval record echoing <domain>, which was not requested` | The echoed `requestedDomain` is not one this client asked about. The record is ignored. This should not happen against a healthy SGP — check for a proxy rewriting the `domain` query parameter. |
-| Every seller reports UNKNOWN and no record pairs | `SGP_BASE_URL` points at an SGP deployment that does not return `requestedDomain` — see [Domain matching](#domain-matching). |
+| Log: `SGP returned an approval record echoing <domain>, which was not requested` | The echoed `requestedDomain` is not one this client asked about. The record is ignored. |
 
 ## Related
 
